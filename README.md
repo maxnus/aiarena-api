@@ -19,7 +19,7 @@ It does the parts every script against aiarena ends up rewriting:
 ## Install
 
 ```bash
-pip install "aiarena-api @ git+https://github.com/maxnus/aiarena-api@v0.1.0"
+pip install aiarena-api
 ```
 
 The distribution is `aiarena-api` and the import name is `aiarena_api`. The bare `aiarena` name on PyPI belongs to an
