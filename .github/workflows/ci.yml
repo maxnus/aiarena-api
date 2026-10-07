@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # The floor, which ai-arena-recap runs on, and the newest.
-        python-version: ["3.11", "3.13"]
+        # Every version the classifiers claim; 3.11 is the floor, which ai-arena-recap runs on.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v7
