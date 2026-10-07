@@ -9,7 +9,8 @@ It does the parts every script against aiarena ends up rewriting:
 
 - **Retries:** server errors and dropped connections are retried with backoff; client errors are raised at once.
   Uploads are sent once, since the server may have stored one it failed to answer for.
-- **Paging:** list endpoints are read to the end with `async for`.
+- **Paging:** list endpoints are read to the end with `async for`, ordered by id so that pages neither repeat nor skip
+  rows that change while they are read.
 - **Pacing:** an optional cap on requests per minute, shared by every concurrent caller, which tightens on its own
   while the server returns errors. aiarena is run by volunteers, so a long job should use it.
 - **Bulk history:** `list_bot_match_participations` reads a bot's whole match history in large pages, ordered so that

@@ -26,7 +26,8 @@ aiarena is run by volunteers on one Django server, and replays are served from t
 the defaults gentle and every bulk path pageable and paceable. Known behaviour of the server, which the client's
 docstrings explain where it matters:
 
-- Offset paging is only stable with `ordering=id` (or `-id`); without it pages overlap and skip.
+- Offset paging is only stable with `ordering=id` (or `-id`); without it pages overlap and skip, worst where rows
+  change during the listing, such as matches finishing in a live round. `paginate` orders by id unless told otherwise.
 - `/match-participations/` ignores its id and match range filters and takes no competition filter. Filter by `bot`.
 - Server cost grows with offset: large pages fail deep into a listing, and an unfiltered listing fails past roughly a
   million rows.

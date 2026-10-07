@@ -121,7 +121,7 @@ class TestPaging:
                 return httpx.Response(200, json={"count": 3, "next": None, "results": [{"id": 3}]})
             page = {
                 "count": 3,
-                "next": f"{BASE}/things/?limit=500&offset=500&round=4",
+                "next": f"{BASE}/things/?limit=500&offset=500&ordering=id&round=4",
                 "results": [{"id": 1}, {"id": 2}],
             }
             return httpx.Response(200, json=page)
@@ -130,8 +130,33 @@ class TestPaging:
         items = run(lambda c: collect(c.paginate("/things/", {"round": 4})))
         assert [i["id"] for i in items] == [1, 2, 3]
         first, second = (dict(call.request.url.params) for call in route.calls)
-        assert first == {"limit": "500", "round": "4"}
-        assert second == {"limit": "500", "offset": "500", "round": "4"}
+        assert first == {"limit": "500", "ordering": "id", "round": "4"}
+        assert second == {"limit": "500", "offset": "500", "ordering": "id", "round": "4"}
+
+    @respx.mock
+    def test_a_listing_keeps_the_order_its_caller_asks_for(self) -> None:
+        """Ordering by id is only the default; an order of the caller's own is just as stable."""
+        route = respx.get(f"{BASE}/matches/").mock(return_value=httpx.Response(200, json={"next": None, "results": []}))
+        run(lambda c: collect(c.paginate("/matches/", {"bot": 961, "ordering": "-id"})))
+        assert route.calls.last.request.url.params["ordering"] == "-id"
+
+    @respx.mock
+    def test_every_listing_method_asks_for_an_order(self) -> None:
+        """Rows that change while a listing is paged, such as matches finishing, move unless the listing is ordered."""
+        route = respx.get(url__startswith=BASE).mock(
+            return_value=httpx.Response(200, json={"next": None, "results": []})
+        )
+
+        async def _run(client: AiArenaClient) -> None:
+            await collect(client.list_competitions())
+            await collect(client.list_competition_participations(37))
+            await collect(client.list_rounds(37))
+            await collect(client.list_matches_for_round(41734))
+            await collect(client.list_match_participations(5030848))
+            await collect(client.list_maps())
+
+        run(_run)
+        assert [call.request.url.params.get("ordering") for call in route.calls] == ["id"] * 6
 
     @respx.mock
     def test_count_asks_for_a_single_item(self) -> None:

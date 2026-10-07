@@ -98,9 +98,14 @@ class AiArenaClient:
         return response.json()
 
     async def paginate(self, path: str, params: Mapping[str, Any] | None = None) -> AsyncIterator[Any]:
-        """Yield every item of a list endpoint, following its `next` links."""
+        """Yield every item of a list endpoint, following its `next` links, ordered by id unless `params` say otherwise.
+
+        Pages are offsets into the listing, so they only add up to it when it has an order. Unordered, the server
+        returns rows in storage order, which shifts when a row is updated, such as a match finishing: a page then
+        repeats a row of the one before and another row falls between the two.
+        """
         url: str | None = path
-        query: Mapping[str, Any] | None = {"limit": self.page_size, **(params or {})}
+        query: Mapping[str, Any] | None = {"limit": self.page_size, "ordering": "id", **(params or {})}
         while url:
             page = await self.get(url, query)
             for item in page.get("results", []):
