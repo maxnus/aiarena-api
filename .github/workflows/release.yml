@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Uploads by trusted publishing: the PyPI project's publisher names this workflow file and this environment.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs reads the version from git tags, and a shallow clone can't be relied on to have them.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Test
+        run: |
+          uv sync --frozen
+          uv run pytest
+
+      - name: Build
+        run: uv build
+
+      # PyPI never accepts a version number twice, so don't upload a build whose version isn't the tag's.
+      - name: Check version
+        run: test -f "dist/aiarena_api-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+
+      - name: Publish
+        run: uv publish

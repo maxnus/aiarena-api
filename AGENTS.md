@@ -53,4 +53,4 @@ Don't add a query parameter to every request; a test that follows a `next` link 
 | Install | `uv sync` |
 | Test | `uv run pytest` |
 | Lint | `uv run ruff check` |
-| Release | push a tag `vX.Y.Z`; the version is read from it by hatch-vcs |
+| Release | push a tag `vX.Y.Z`; `release.yml` publishes it to PyPI, with the version read from the tag by hatch-vcs |
