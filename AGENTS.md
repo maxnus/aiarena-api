@@ -32,6 +32,10 @@ docstrings explain where it matters:
   million rows.
 - Declared filters are not proof that a filter works. Check a new one against the live API before relying on it.
 
+And of httpx: passing `params=` replaces a URL's whole query rather than merging into it. The client asks for JSON with
+an `Accept` header, never a `format` parameter, so that a `next` link is requested exactly as the server wrote it.
+Don't add a query parameter to every request; a test that follows a `next` link must give that link a query.
+
 ## Conventions
 
 - Python 3.11 is the floor (ai-arena-recap runs on it), so no `type X = ...` statements or `def f[T]()` generics.

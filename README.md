@@ -8,6 +8,7 @@ other.
 It does the parts every script against aiarena ends up rewriting:
 
 - **Retries:** server errors and dropped connections are retried with backoff; client errors are raised at once.
+  Uploads are sent once, since the server may have stored one it failed to answer for.
 - **Paging:** list endpoints are read to the end with `async for`.
 - **Pacing:** an optional cap on requests per minute, shared by every concurrent caller, which tightens on its own
   while the server returns errors. aiarena is run by volunteers, so a long job should use it.
@@ -71,7 +72,9 @@ async with AiArenaClient(rate_per_minute=10) as client:
 ```
 
 Endpoints without a method of their own are reachable with `client.get(path, params)`, `client.paginate(path, params)`
-and `client.count(path, params)`, which take a path relative to `https://aiarena.net/api/`.
+and `client.count(path, params)`, which take a path relative to `https://aiarena.net/api/`. An absolute URL is accepted
+only on the API's own server, because every request carries your token; fetch anything else, such as a replay's
+signed download URL, with a plain HTTP client.
 
 ## Develop
 

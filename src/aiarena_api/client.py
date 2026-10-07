@@ -64,7 +64,10 @@ class AiArenaClient:
         self.page_size = page_size
         self.bulk_page_size = bulk_page_size
         self.pacer = Pacer(rate_per_minute)
-        self._client = httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Token {token}"})
+        # JSON is asked for with a header rather than DRF's `format` query parameter: passing httpx any params replaces
+        # a URL's whole query, which would strip the offset and filters from the `next` links that paging follows.
+        headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
+        self._client = httpx.AsyncClient(timeout=timeout, headers=headers)
         self._sem = asyncio.Semaphore(concurrency)
 
     async def close(self) -> None:
@@ -84,13 +87,14 @@ class AiArenaClient:
     # --- Generic requests
 
     async def get(self, path: str, params: Mapping[str, Any] | None = None, *, max_attempts: int = 5) -> Any:
-        """GET the JSON at `path`, which is relative to the base URL or absolute.
+        """GET the JSON at `path`, which is relative to the base URL or an absolute URL on the API's server.
 
+        `params` replaces any query an absolute URL already carries; pass None to request such a URL as it is.
         `max_attempts` is 5 by default, where a 5xx is usually a blip worth riding out. A caller that can make the
         request cheaper instead should pass fewer: retrying an over-expensive query unchanged costs the server the
         same failed work every time.
         """
-        response = await self._send("GET", path, params={"format": "json", **(params or {})}, max_attempts=max_attempts)
+        response = await self._send("GET", path, params=params, max_attempts=max_attempts)
         return response.json()
 
     async def paginate(self, path: str, params: Mapping[str, Any] | None = None) -> AsyncIterator[Any]:
@@ -155,25 +159,26 @@ class AiArenaClient:
         manageable; paging the endpoint unfiltered fails with 504s past about a million rows.
 
         Ordering by id is what makes offset paging well defined; without it pages overlap and skip. A row already
-        yielded is skipped, so a match that finishes mid-iteration, which shifts a newest-first listing by one row,
-        yields no duplicate.
+        yielded is not yielded again, so a match that finishes mid-iteration, which shifts a newest-first listing by
+        one row, yields no duplicate.
 
         Pages shrink as they get expensive. Server cost grows with offset, so a page size that is comfortable at the
-        start of a long career fails deep into it. On a server error the page size drops and the same offset is
-        retried, which is safe because offsets count rows; it never grows back, since offsets only get deeper.
+        start of a long career fails deep into it. When the server signals distress, as `_send` reads it, the page
+        size drops and the same offset is retried, which is safe because offsets count rows; it never grows back,
+        since offsets only get deeper. Any other refusal is raised at once, since a smaller page cannot fix it.
         """
         limit = page_size or self.bulk_page_size
         ordering = "-id" if newest_first else "id"
         offset = 0
         total: int | None = None
-        last_id: int | None = None
+        seen: set[int] = set()
         while total is None or offset < total:
             params = {"limit": limit, "offset": offset, "bot": bot_id, "ordering": ordering}
             try:
                 page = await self.get("/match-participations/", params, max_attempts=2)
             except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-                client_error = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
-                if client_error or limit <= MIN_BULK_PAGE_SIZE:
+                refused = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in _RETRY_STATUSES
+                if refused or limit <= MIN_BULK_PAGE_SIZE:
                     raise
                 limit = max(MIN_BULK_PAGE_SIZE, limit // 4)
                 log.warning("Dropping to %d-row pages for bot %s at offset %d", limit, bot_id, offset)
@@ -183,8 +188,8 @@ class AiArenaClient:
             if not results:
                 break
             for item in results:
-                if last_id is None or (item["id"] < last_id if newest_first else item["id"] > last_id):
-                    last_id = item["id"]
+                if item["id"] not in seen:
+                    seen.add(item["id"])
                     yield item
             offset += len(results)
 
@@ -213,11 +218,16 @@ class AiArenaClient:
         bot_zip_publicly_downloadable: bool | None = None,
         bot_data_publicly_downloadable: bool | None = None,
         bot_data_enabled: bool | None = None,
+        timeout: float = 300.0,
     ) -> dict[str, Any]:
         """Change a bot the token's user owns: upload a zip or data, replace its wiki article, or set its flags.
 
         Only the arguments given are sent. The server refuses new bot data while the data is frozen, which it is
         while the bot plays a match.
+
+        The request is sent once, without retries: a timeout or a server error can come after the server has stored
+        the upload, and every send of `wiki_article_content` adds a revision to the article. `timeout` is generous
+        because the server checks an uploaded zip before it answers.
         """
         fields = {
             "wiki_article_content": wiki_article_content,
@@ -226,15 +236,16 @@ class AiArenaClient:
             "bot_data_enabled": bot_data_enabled,
         }
         data = {name: value for name, value in fields.items() if value is not None}
-        # Read whole, so that a retry can send the file again.
         files = {
-            name: (path.name, path.read_bytes(), "application/zip")
+            name: (path.name, await asyncio.to_thread(path.read_bytes), "application/zip")
             for name, path in (("bot_zip", bot_zip), ("bot_data", bot_data))
             if path is not None
         }
         if not data and not files:
             raise ValueError("update_bot needs at least one field to change")
-        response = await self._send("PATCH", f"/bots/{bot_id}/", data=data, files=files or None)
+        response = await self._send(
+            "PATCH", f"/bots/{bot_id}/", data=data, files=files or None, max_attempts=1, timeout=timeout
+        )
         return response.json()
 
     # --- Files
@@ -258,9 +269,13 @@ class AiArenaClient:
     # --- Private
 
     def _url(self, path: str) -> str:
-        if path.startswith(("http://", "https://")):
-            return path
-        return f"{self.base_url}/{path.lstrip('/')}"
+        """The absolute URL for `path`, refusing one on another server, since every request carries the token."""
+        if not path.startswith(("http://", "https://")):
+            return f"{self.base_url}/{path.lstrip('/')}"
+        url, base = httpx.URL(path), httpx.URL(self.base_url)
+        if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
+            raise ValueError(f"{path} is not on the API's server {self.base_url}, and would be sent the token")
+        return path
 
     async def _send(
         self,
@@ -271,15 +286,20 @@ class AiArenaClient:
         data: Mapping[str, Any] | None = None,
         files: Mapping[str, Any] | None = None,
         max_attempts: int = 5,
+        timeout: float | None = None,
     ) -> httpx.Response:
-        """Send a request with retries and backoff, and feed the server's distress back into the pacing."""
+        """Send a request with retries and backoff, and feed the server's distress back into the pacing.
+
+        `timeout` overrides the client's for this request; None keeps the client's.
+        """
         url = self._url(path)
+        options: dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
         await self.pacer.wait()
         async with self._sem:
             last = max_attempts - 1
             for attempt in range(max_attempts):
                 try:
-                    response = await self._client.request(method, url, params=params, data=data, files=files)
+                    response = await self._client.request(method, url, params=params, data=data, files=files, **options)
                 except httpx.TransportError as exc:
                     self.pacer.slow_down()
                     if attempt == last:

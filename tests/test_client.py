@@ -59,13 +59,22 @@ class TestGet:
     def test_paths_are_relative_to_the_base_url_and_ask_for_json(self) -> None:
         route = respx.get(f"{BASE}/bots/7/").mock(return_value=httpx.Response(200, json={"id": 7}))
         assert run(lambda c: c.get("bots/7/")) == {"id": 7}
-        assert route.calls.last.request.url.params["format"] == "json"
+        request = route.calls.last.request
+        assert request.headers["Accept"] == "application/json"
+        assert not request.url.params
 
     @respx.mock
-    def test_an_absolute_url_is_used_as_it_is(self) -> None:
-        route = respx.get("https://elsewhere.test/thing/").mock(return_value=httpx.Response(200, json={}))
-        run(lambda c: c.get("https://elsewhere.test/thing/"))
-        assert route.called
+    def test_an_absolute_url_keeps_its_query(self) -> None:
+        route = respx.get(f"{BASE}/rounds/").mock(return_value=httpx.Response(200, json={}))
+        run(lambda c: c.get(f"{BASE}/rounds/?competition=37&offset=500"))
+        assert dict(route.calls.last.request.url.params) == {"competition": "37", "offset": "500"}
+
+    @respx.mock
+    def test_a_url_on_another_server_is_refused_before_it_gets_the_token(self) -> None:
+        route = respx.get("https://elsewhere.test/replay.SC2Replay").mock(return_value=httpx.Response(200))
+        with pytest.raises(ValueError, match="elsewhere.test"):
+            run(lambda c: c.get("https://elsewhere.test/replay.SC2Replay"))
+        assert not route.called
 
     @respx.mock
     def test_a_5xx_is_retried_until_it_succeeds(self, fast_sleep: None) -> None:
@@ -104,17 +113,25 @@ class TestGet:
 
 class TestPaging:
     @respx.mock
-    def test_paginate_follows_the_next_links(self) -> None:
-        page1 = {"results": [{"id": 1}, {"id": 2}], "next": f"{BASE}/things/page2"}
-        page2 = {"results": [{"id": 3}], "next": None}
-        respx.get(f"{BASE}/things/page2").mock(return_value=httpx.Response(200, json=page2))
-        first = respx.get(f"{BASE}/things/").mock(return_value=httpx.Response(200, json=page1))
+    def test_paginate_follows_the_next_links_with_their_query_intact(self) -> None:
+        """A next link carries the offset and the filters; losing them re-reads the first page forever."""
 
+        def responder(request: httpx.Request) -> httpx.Response:
+            if request.url.params.get("offset") == "500":
+                return httpx.Response(200, json={"count": 3, "next": None, "results": [{"id": 3}]})
+            page = {
+                "count": 3,
+                "next": f"{BASE}/things/?limit=500&offset=500&round=4",
+                "results": [{"id": 1}, {"id": 2}],
+            }
+            return httpx.Response(200, json=page)
+
+        route = respx.get(f"{BASE}/things/").mock(side_effect=responder)
         items = run(lambda c: collect(c.paginate("/things/", {"round": 4})))
         assert [i["id"] for i in items] == [1, 2, 3]
-        params = first.calls.last.request.url.params
-        assert params["round"] == "4"
-        assert int(params["limit"]) == 500
+        first, second = (dict(call.request.url.params) for call in route.calls)
+        assert first == {"limit": "500", "round": "4"}
+        assert second == {"limit": "500", "offset": "500", "round": "4"}
 
     @respx.mock
     def test_count_asks_for_a_single_item(self) -> None:
@@ -156,6 +173,15 @@ class TestBotParticipations:
         assert params["limit"] == "50"
 
     @respx.mock
+    def test_a_row_out_of_order_is_still_yielded(self) -> None:
+        """Skipping repeats must not turn a page the server sorted differently into lost rows."""
+        respx.get(f"{BASE}/match-participations/").mock(
+            return_value=httpx.Response(200, json={"count": 3, "results": [{"id": 3}, {"id": 1}, {"id": 2}]})
+        )
+        rows = run(lambda c: collect(c.list_bot_match_participations(42)))
+        assert [r["id"] for r in rows] == [3, 1, 2]
+
+    @respx.mock
     def test_a_row_shifted_onto_the_next_page_is_not_yielded_twice(self) -> None:
         """A match finishing between two newest-first pages pushes every row down by one."""
         pages = {
@@ -170,8 +196,12 @@ class TestBotParticipations:
         assert [r["id"] for r in rows] == [9, 8, 7, 6]
 
     @respx.mock
-    def test_the_page_shrinks_after_a_server_error_and_the_offset_is_retried(self, fast_sleep: None) -> None:
-        """Server cost grows with offset, so a page size that works early in a long career fails deep into it."""
+    @pytest.mark.parametrize("status", [502, 429])
+    def test_the_page_shrinks_after_a_server_error_and_the_offset_is_retried(
+        self, fast_sleep: None, status: int
+    ) -> None:
+        """Server cost grows with offset, so a page size that works early in a long career fails deep into it. A
+        429 is the server asking for less, too."""
         big = 2000
         rows = [{"id": i} for i in range(1, big + 1)]
 
@@ -181,7 +211,7 @@ class TestBotParticipations:
             if offset == 0:
                 return httpx.Response(200, json={"count": big + 1, "results": rows})
             if limit == big:  # Deep down, only a smaller page is served.
-                return httpx.Response(502)
+                return httpx.Response(status)
             return httpx.Response(200, json={"count": big + 1, "results": [{"id": 9999}]})
 
         respx.get(f"{BASE}/match-participations/").mock(side_effect=responder)
@@ -224,14 +254,24 @@ class TestUpdateBot:
         assert b'name="bot_data"' not in body
 
     @respx.mock
-    def test_a_retried_upload_sends_the_file_again(self, tmp_path: Path, fast_sleep: None) -> None:
+    def test_an_upload_is_sent_once(self, tmp_path: Path, fast_sleep: None) -> None:
+        """The server may have stored an upload before it failed to answer, so a retry is the caller's decision."""
         bot_zip = tmp_path / "MyBot.zip"
         bot_zip.write_bytes(b"zip-bytes")
-        route = respx.patch(f"{BASE}/bots/961/").mock(side_effect=[httpx.Response(502), httpx.Response(200, json={})])
+        route = respx.patch(f"{BASE}/bots/961/").mock(return_value=httpx.Response(502))
 
-        run(lambda c: c.update_bot(961, bot_zip=bot_zip))
-        assert route.call_count == 2
-        assert b"zip-bytes" in route.calls.last.request.content
+        with pytest.raises(httpx.HTTPStatusError):
+            run(lambda c: c.update_bot(961, bot_zip=bot_zip))
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_an_upload_waits_longer_than_other_requests(self, tmp_path: Path) -> None:
+        bot_zip = tmp_path / "MyBot.zip"
+        bot_zip.write_bytes(b"zip-bytes")
+        route = respx.patch(f"{BASE}/bots/961/").mock(return_value=httpx.Response(200, json={}))
+
+        run(lambda c: c.update_bot(961, bot_zip=bot_zip, timeout=600.0))
+        assert route.calls.last.request.extensions["timeout"]["read"] == 600.0
 
     def test_nothing_to_change_is_refused(self) -> None:
         with pytest.raises(ValueError):
